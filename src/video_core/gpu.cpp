@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <list>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -331,44 +332,71 @@ struct GPU::Impl {
         gpu_thread.FlushAndInvalidateRegion(addr, size, is_async);
     }
 
+    /// Frames are shown strictly in the order they were requested. Each request waits for its own
+    /// GPU fence, and on a slower host GPU a later frame's fence can be reached before an earlier
+    /// one's, which used to show the older frame after the newer one (the picture jumped back).
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
-        const size_t num_fences{fences.size()};
-        size_t current_request_counter{};
-        if (num_fences != 0) {
-            std::unique_lock<std::mutex> lk(request_swap_mutex);
-            if (free_swap_counters.empty()) {
-                current_request_counter = request_swap_counters.size();
-                request_swap_counters.emplace_back(num_fences);
-            } else {
-                current_request_counter = free_swap_counters.front();
-                request_swap_counters[current_request_counter] = num_fences;
-                free_swap_counters.pop_front();
-            }
+        auto request = std::make_shared<PendingComposite>();
+        request->remaining = fences.size();
+        request->ready = fences.empty();
+        request->layers = std::move(layers);
+        {
+            std::scoped_lock lk{request_swap_mutex};
+            pending_composites.push_back(request);
         }
         pending_composite_fence = RequestSyncOperation(
-            [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
-                if (num_fences == 0) {
-                    renderer->Composite(composite_layers);
+            [this, request, composite_fences = std::move(fences)] {
+                if (composite_fences.empty()) {
+                    DrainComposites();
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
+                const auto executer = [this, request]() {
                     {
-                        std::unique_lock<std::mutex> lk(request_swap_mutex);
-                        if (--request_swap_counters[current_request_counter] != 0) {
+                        std::scoped_lock lk{request_swap_mutex};
+                        if (request->dropped || --request->remaining != 0) {
                             return;
                         }
-                        free_swap_counters.push_back(current_request_counter);
+                        request->ready = true;
                     }
-                    renderer->Composite(composite_layers);
+                    DrainComposites();
                 };
-                for (size_t i = 0; i < num_fences; i++) {
-                    syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
-                                                          composite_fences[i].value, executer);
+                for (const auto& fence : composite_fences) {
+                    syncpoint_manager.RegisterGuestAction(fence.id, fence.value, executer);
                 }
             });
         gpu_thread.TickGPU(is_async);
+    }
+
+    /// Shows every request at the front of the queue whose fences were reached. One thread drains
+    /// at a time; a request that finishes meanwhile is picked up by the running drain.
+    void DrainComposites() {
+        {
+            std::scoped_lock lk{request_swap_mutex};
+            if (compositing) {
+                return;
+            }
+            compositing = true;
+        }
+        for (;;) {
+            std::shared_ptr<PendingComposite> next;
+            {
+                std::scoped_lock lk{request_swap_mutex};
+                // A frame whose fence never arrives must not hold back the ones behind it for good.
+                while (pending_composites.size() > MAX_PENDING_COMPOSITES &&
+                       !pending_composites.front()->ready) {
+                    pending_composites.front()->dropped = true;
+                    pending_composites.pop_front();
+                }
+                if (pending_composites.empty() || !pending_composites.front()->ready) {
+                    compositing = false;
+                    return;
+                }
+                next = std::move(pending_composites.front());
+                pending_composites.pop_front();
+            }
+            renderer->Composite(next->layers);
+        }
     }
 
     void WaitForComposite() {
@@ -447,8 +475,15 @@ struct GPU::Impl {
     Tegra::Control::ChannelState* current_channel;
     s32 bound_channel{-1};
 
-    std::deque<size_t> free_swap_counters;
-    std::deque<size_t> request_swap_counters;
+    struct PendingComposite {
+        size_t remaining{};
+        bool ready{};
+        bool dropped{};
+        std::vector<Tegra::FramebufferConfig> layers;
+    };
+    static constexpr size_t MAX_PENDING_COMPOSITES = 8;
+    std::deque<std::shared_ptr<PendingComposite>> pending_composites;
+    bool compositing{};
     std::mutex request_swap_mutex;
     u64 pending_composite_fence{};
 };
